@@ -1,0 +1,29 @@
+/* Try multiple selectors to hide navigation items */
+/* Hide by URL patterns */
+a[href="/"],
+a[href="/home"],
+a[href="/products"],
+a[href^="/products"] {
+    display: none !important;
+}
+
+/* Hide by text content using attribute selectors (if applicable) */
+a[title="Home"],
+a[title="Shop"] {
+    display: none !important;
+}
+
+/* Try to hide parent li elements */
+li a[href="/"],
+li a[href="/home"],
+li a[href="/products"],
+li a[href^="/products"] {
+    display: none !important;
+}
+
+li a[href="/"],
+li a[href="/home"],
+li a[href="/products"],
+li a[href^="/products"] {
+    display: none !important;
+}
