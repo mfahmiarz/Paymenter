@@ -5,6 +5,7 @@ namespace Paymenter\Extensions\Servers\Pterodactyl;
 use App\Classes\Extension\Server;
 use App\Models\Service;
 use Exception;
+use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\HtmlString;
 use Illuminate\Support\Str;
@@ -14,6 +15,11 @@ use Illuminate\Support\Str;
  */
 class Pterodactyl extends Server
 {
+    public function boot()
+    {
+        require __DIR__ . '/routes/web.php';
+    }
+
     public function getConfig($values = []): array
     {
         return [
@@ -33,6 +39,40 @@ class Pterodactyl extends Server
                 'required' => true,
                 'encrypted' => true,
             ],
+            [
+                'name' => 'sso_enabled',
+                'label' => 'Enable SSO (Auto Login)',
+                'type' => 'checkbox',
+                'description' => 'Enable Single Sign-On to allow clients to login to Pterodactyl with one click',
+                'default' => false,
+            ],
+            [
+                'name' => 'connect_timeout',
+                'label' => 'Connect Timeout (seconds)',
+                'type' => 'number',
+                'description' => 'How long to wait for a TCP/TLS connection to the panel API.',
+                'default' => 10,
+                'required' => true,
+                'validation' => 'integer|min:1|max:60',
+            ],
+            [
+                'name' => 'request_timeout',
+                'label' => 'Request Timeout (seconds)',
+                'type' => 'number',
+                'description' => 'Maximum total time to wait for an API response.',
+                'default' => 30,
+                'required' => true,
+                'validation' => 'integer|min:3|max:180',
+            ],
+            [
+                'name' => 'request_retries',
+                'label' => 'Request Retries',
+                'type' => 'number',
+                'description' => 'Retry count for transient network failures.',
+                'default' => 2,
+                'required' => true,
+                'validation' => 'integer|min:0|max:5',
+            ],
         ];
     }
 
@@ -51,13 +91,25 @@ class Pterodactyl extends Server
     {
         // Trim any leading slashes from the base url and add the path URL to it
         $req_url = rtrim($this->config('host'), '/') . $url;
+        $method = strtolower($method);
+        $connectTimeout = max(1, (int) ($this->config('connect_timeout') ?: 10));
+        $requestTimeout = max($connectTimeout, (int) ($this->config('request_timeout') ?: 30));
+        $retries = max(0, (int) ($this->config('request_retries') ?: 2));
+
         $response = Http::withHeaders([
             'Authorization' => 'Bearer ' . $this->config('api_key'),
             'Accept' => 'application/json',
-        ])->$method($req_url, $data);
+        ])
+            ->connectTimeout($connectTimeout)
+            ->timeout($requestTimeout)
+            ->retry($retries, 300, throw: false)
+            ->$method($req_url, $data);
 
         if (!$response->successful()) {
-            throw new Exception($response->json()['errors'][0]['detail']);
+            $payload = $response->json();
+            $message = $payload['errors'][0]['detail'] ?? $payload['message'] ?? ('HTTP ' . $response->status());
+
+            throw new Exception($message);
         }
 
         return $response->json() ?? [];
@@ -363,7 +415,7 @@ class Pterodactyl extends Server
                     throw new Exception('No available allocations found on the selected node.');
                 }
                 $allocation = $availablePorts->first();
-                $environment['SERVER_PORT'] = $allocation['port'];
+                $environment['SERVER_PORT'] = (string) $allocation['port'];
 
                 // Return the allocation id for the SERVER_PORT
                 return [
@@ -511,7 +563,7 @@ class Pterodactyl extends Server
             // Assign the allocations to the environment
             if ($key !== 'NONE') {
                 if (isset($environment[$key])) {
-                    $environment[$key] = $value['port'];
+                    $environment[$key] = (string) $value['port'];
                 }
             }
 
@@ -640,13 +692,109 @@ class Pterodactyl extends Server
     public function getActions(Service $service)
     {
         $server = $this->getServer($service->id, raw: true);
+        $serverIdentifier = $server['attributes']['identifier'];
+        $baseUrl = rtrim($this->config('host'), '/');
 
+        // Check if SSO is enabled and the login route is available.
+        // If the route is missing, fall back to the direct panel URL.
+        if ($this->config('sso_enabled') && \Illuminate\Support\Facades\Route::has('pterodactyl.sso.login')) {
+            // Generate SSO URL using the route
+            return [
+                [
+                    'type' => 'button',
+                    'label' => 'Go to panel',
+                    'url' => route('pterodactyl.sso.login', [
+                        'service' => $service->id,
+                        'server' => $serverIdentifier,
+                    ]),
+                ],
+            ];
+        }
+
+        // Regular link without SSO
         return [
             [
                 'type' => 'button',
-                'label' => 'Go to server',
-                'url' => $this->config('host') . '/server/' . $server['attributes']['identifier'],
+                'label' => 'Go to panel',
+                'url' => $baseUrl . '/server/' . $serverIdentifier,
             ],
         ];
+    }
+
+    /**
+     * Login user via SSO and redirect to the service server page.
+     */
+    public function ssoLogin(Service $service, ?string $server = null): RedirectResponse
+    {
+        $serverData = $this->getServer($service->id, raw: true);
+        $serverIdentifier = $serverData['attributes']['identifier'];
+        $baseUrl = rtrim($this->config('host'), '/');
+
+        if (!$this->config('sso_enabled')) {
+            return redirect()->away($baseUrl . '/server/' . $serverIdentifier);
+        }
+
+        $serverTarget = $serverIdentifier;
+        $tokenData = $this->generateSsoToken($service, $serverTarget);
+
+        if (!$tokenData || empty($tokenData['token'])) {
+            return redirect()->away($baseUrl . '/server/' . $serverIdentifier);
+        }
+
+        return redirect()->away($this->buildSsoUrl($tokenData['token'], $serverTarget));
+    }
+
+    /**
+     * Generate an SSO token for the user.
+     */
+    public function generateSsoToken(Service $service, ?string $serverUuid = null): ?array
+    {
+        try {
+            $user = $service->user;
+
+            $response = $this->request('/api/application/sso/token', 'post', [
+                'email' => $user->email,
+                'server_uuid' => $serverUuid,
+                'ip_address' => request()->ip(),
+                'first_name' => $user->first_name,
+                'last_name' => $user->last_name,
+            ]);
+
+            if (isset($response['success']) && $response['success'] && isset($response['data']['token'])) {
+                return $response['data'];
+            }
+
+            return null;
+        } catch (Exception $e) {
+            // Log the error but don't throw - fallback to non-SSO
+            \Log::error('Pterodactyl SSO token generation failed: ' . $e->getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Build the SSO login URL.
+     */
+    public function buildSsoUrl(string $token, ?string $serverUuid = null): string
+    {
+        $baseUrl = rtrim($this->config('host'), '/');
+        $url = $baseUrl . '/auth/sso/login?token=' . urlencode($token);
+
+        if ($serverUuid) {
+            $url .= '&server=' . urlencode($serverUuid);
+        }
+
+        return $url;
+    }
+
+    public function migrateOption(string $key, ?string $value)
+    {
+        return match ($key) {
+            'egg' => ['key' => 'egg_id', 'value' => $value],
+            'nest' => ['key' => 'nest_id', 'value' => $value],
+            'allocation' => ['key' => 'additional_allocations', 'value' => $value],
+            'location' => ['key' => 'location_ids', 'value' => json_encode([$value]), 'type' => 'array'],
+            default => ['key' => $key, 'value' => $value]
+        };
     }
 }

@@ -14,9 +14,22 @@ class CPanel extends Server
     private function request($endpoint, $method = 'get', $data = [])
     {
         $host = rtrim($this->config('host'), '/');
-        $response = Http::withHeaders([
-            'Authorization' => 'whm ' . $this->config('username') . ':' . $this->config('apikey'),
-        ])->$method($host . '/json-api' . $endpoint, $data)->throw();
+        $http = Http::withOptions(['verify' => false]);
+        
+        // Try basic auth first (for root password), fallback to WHM API auth
+        if ($this->config('apikey') && strlen($this->config('apikey')) > 20) {
+            // Likely an API key
+            $http->withHeaders([
+                'Authorization' => 'whm ' . $this->config('username') . ':' . $this->config('apikey'),
+            ]);
+        } else {
+            // Likely a password, use basic auth
+            $http->withOptions([
+                'auth' => [$this->config('username'), $this->config('apikey')],
+            ]);
+        }
+        
+        $response = $http->$method($host . '/json-api' . $endpoint, $data)->throw();
 
         return $response;
     }
