@@ -82,7 +82,7 @@ class Duitku extends Gateway
 
         $params = [
             'merchantCode' => $merchantCode,
-            'paymentAmount' => (int) $total,
+            'paymentAmount' => (int) ceil($total),
             'merchantOrderId' => (string) $orderId,
             'productDetails' => $description,
             'merchantUserInfo' => 'client@example.com',
@@ -149,7 +149,20 @@ class Duitku extends Gateway
         }
 
         if ($resultCode === '00') {
-		ExtensionHelper::addPayment($merchantOrderId, 'Duitku', $amount);
+		$transaction = ExtensionHelper::addPayment($merchantOrderId, 'Duitku', $amount);
+		
+		// Ensure invoice status is updated to paid if remaining <= 0 or within tolerance (0.21 for rounding)
+		$invoice = $transaction->invoice;
+		if ($invoice->remaining <= 0.21 && $invoice->status !== 'paid') {
+			$invoice->update(['status' => 'paid']);
+			Log::info('Duitku: Invoice status updated to paid', [
+				'invoice_id' => $invoice->id,
+				'invoice_number' => $invoice->number,
+				'remaining' => $invoice->remaining,
+				'amount_paid' => $amount,
+			]);
+		}
+		
             return response()->json(['success' => true]);
         } elseif (in_array($resultCode, ['01', '02'])) {
             return response()->json(['success' => true]);
